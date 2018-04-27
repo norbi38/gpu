@@ -11,98 +11,136 @@
 #include <opencv2/highgui/highgui.hpp>
 
 
+using namespace cv;
+using namespace std;
 
-__device__ float gauss(float x[], float omega)
+
+int rows;
+int cols;
+
+float *d_gaussKernel;
+
+__global__ void GaussFilter(uchar *source,uchar *dest, float *kernel,int X,int Y)
 {
-	float pikob = pow(2 * CV_PI, 3);
-	
-	float a = 1 / (pow(omega, 3)*sqrt(pikob));
+	int idx = blockIdx.x*blockDim.x*3 + threadIdx.x*3;
 
-	float gauss = a * exp(-(pow(x[0], 2) + pow(x[1], 2) + pow(x[2], 2)) / pow(omega, 2));
+	int kernelX = X / 2;
+	int kernelY = Y / 2;
+	int row = blockDim.x*3;
 
-	return gauss;
+	for (int color = 0; color < 3; color++)
+	{
+		float sum = 0;
+		for (int x = -kernelX; x <= kernelX; x++)
+		{
+			for (int y = -kernelY; y <= kernelY; y++)
+			{
+				sum += (float)source[idx + color+x*row+y*3]*kernel[(x+kernelX)*X+y+kernelY];
+			}
+		}
+		dest[idx + color] =(uchar) sum;
+	}
+
 }
-__global__ void gaussFilter(cv::Mat dev_Image)
+
+void GaussKernelGenerator(int x, int y,float sigma)
 {
-	float x = blockIdx.x;
-	float y = threadIdx.x;
-	float in = dev_Image.at<float>(x, y);
-	
-	dev_Image.at<float>(x, y)= gauss(&in, 3);
+	float *valami=new float[x*y];
+	float A = 1 / (2 * CV_PI*powf(sigma, 2));
+
+	int distX = x / 2;
+	int distY = y / 2;
+
+	for (int i = 0; i < x; i++)
+	{
+		for (int j = 0; j < y; j++)
+		{
+			valami[i*x+j] = A * expf(-(powf(i-distX, 2) + powf(j-distY, 2)) / (2 * powf(sigma, 2)));
+			cout << valami[i*x+j] << "\t";
+		}
+		cout << endl;
+	}
+		
+	cudaMalloc((void**)&d_gaussKernel, sizeof(float)*x*y);
+	cudaMemcpy(d_gaussKernel, valami, sizeof(float)*x*y, cudaMemcpyHostToDevice);
+
+	delete valami;
 }
 
+uchar* createPointers(uint bytes, uchar **devicePtr)
+{
+	uchar *ptr = NULL;
+	cudaSetDeviceFlags(cudaDeviceMapHost);
+	cudaHostAlloc(&ptr, bytes, cudaHostAllocMapped);
+	cudaHostGetDevicePointer(devicePtr, ptr, 0);
+	return ptr;
+}
 
 int main(int argc, char** argv)
 {
+	/*cudaDeviceProp  prop;
+	int whichDevice;
+	cudaGetDevice(&whichDevice);
+	cudaGetDeviceProperties(&prop, whichDevice);
+	cout << prop.name << "\t" << prop.canMapHostMemory;*/
 
-	// Open a webcamera
-	cv::VideoCapture camera(0);
-	cv::Mat          frame;
-	cv::Mat          source;
+	int kernelX = 5;
+	int kernelY = 5;
+	GaussKernelGenerator(kernelX, kernelY, 3);
+
+
+	VideoCapture camera(0);
+	Mat          frame;
+
 	if (!camera.isOpened())
 		return -1;
 	 
-	// Create the capture windows
-	cv::namedWindow("Source");
-	cv::namedWindow("Gauss");
+	namedWindow("Source");
+	namedWindow("Gauss");
+	//namedWindow("Bilateral");
 
-	// Create the cuda event timers 
 	cudaEvent_t start, stop;
 	cudaEventCreate(&start);
 	cudaEventCreate(&stop);
 
+	camera >> frame;	
 
-	// Create CPU/GPU shared images - one for the initial and one for the result
-	camera >> source;
-	frame = source;
+	rows = frame.rows;
+	cols = frame.cols;
+	int a = frame.type();
 
-	/*cv::Mat dev_Image=NULL;
-	cudaMalloc(&dev_Image, sizeof(frame));*/
-	while (1)
-	{
-		// Capture the image and store a gray conversion to the gpu
-		camera >> source;
-		frame = source;
-		// Record the time it takes to process
+	uchar *d_source, *d_gauss, *d_bilateral;
+	Mat source(frame.size(), a, createPointers(rows*cols * 3, &d_source));
+	Mat gauss(frame.size(), a, createPointers(rows*cols * 3, &d_gauss));
+	//Mat bilateral(frame.size(), a, createPointers(rows*cols * 3, &d_bilateral));
+
+	while (true)
+	{		
+		camera >> frame;
+		frame.copyTo(source);
+
 		cudaEventRecord(start);
 		{
 
-			//for (size_t i = 0; i < frame.rows; i++)
-			//{
-			//	for (size_t j = 0; j < frame.cols; j++)
-			//	{
-			//		////cv::Vec3b a = frame.at<cv::Vec3b>(cv::Point(i, j));
-			//		//std::cout << "B: " << (int)a[0] << " G: " << (int)a[1] << " C: " << (int)a[2] << std::endl;					
-			//		/*a[0] =(int)a[0] / 10;
-			//		a[1] =(int)a[1] / 10;
-			//		a[2] =(int)a[2] / 10;*/
-			//		frame.at<uchar>(i, j) /= 10;
-			//		
-			//	}				
-			//}
-			int width = frame.size().width;
-			int height = frame.size().height;
-
-			gaussFilter << <height, width >> > (&frame);
+			GaussFilter << <rows, cols >> > (d_source, d_gauss,d_gaussKernel,kernelX,kernelY);
+			//GaussFilter << <rows, cols >> > (d_gauss, d_bilateral, d_gaussKernel, kernelX, kernelY);
 
 			cudaThreadSynchronize();
-
-			//cudaMemcpyFromSymbol(&frame, &dev_Image, sizeof(dev_Image));
 		}
-		cudaEventRecord(stop);
+		cudaEventRecord(stop);		
 
-		//Display the elapsed time
 		float ms = 0.0f;
 		cudaEventSynchronize(stop);
 		cudaEventElapsedTime(&ms, start, stop);
-		std::cout << "Elapsed GPU time: " << ms << " milliseconds" << std::endl;
+		cout << "Elapsed GPU time: " << ms << " milliseconds" << endl;
 
-		// Show the results
-		cv::imshow("Source", source);
-		cv::imshow("Gauss", frame);
 
-		// Spin
-		if (cv::waitKey(1) == 27) break;
+		imshow("Source", frame);
+		imshow("Gauss", gauss);
+		//imshow("Bilateral", bilateral);
+
+
+		if (waitKey(1) == 27) break;
 	}
 
 	return 0;
